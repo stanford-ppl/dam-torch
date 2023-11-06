@@ -31,6 +31,20 @@ impl<T> Model<T> {
     }
 }
 
+impl<T> std::ops::Deref for Model<T> {
+    type Target = Option<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.module
+    }
+}
+
+impl<T> std::ops::DerefMut for Model<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.module
+    }
+}
+
 impl super::manager::Job for Model<tch::CModule> {
     fn load(&mut self, device: tch::Device) {
         assert!(self.module.is_none());
