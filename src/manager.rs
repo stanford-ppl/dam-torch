@@ -184,14 +184,16 @@ mod test {
 
         let test_tensor = tch::Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4]);
 
-        let r1 = job_manager().with_license(tch::Device::Cpu, &ref1, |jref| {
+        let device = tch::Device::cuda_if_available();
+
+        let r1 = job_manager().with_license(device, &ref1, |jref| {
             jref.job()
                 .as_ref()
                 .unwrap()
                 .forward_ts(&[&test_tensor])
                 .unwrap()
         });
-        let r2 = job_manager().with_license(tch::Device::Cpu, &ref2, |jref| {
+        let r2 = job_manager().with_license(device, &ref2, |jref| {
             jref.job()
                 .as_ref()
                 .unwrap()
@@ -199,6 +201,7 @@ mod test {
                 .unwrap()
         });
 
+        dbg!(device);
         let _ = dbg!(r1);
         let _ = dbg!(r2);
     }
