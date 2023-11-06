@@ -4,8 +4,6 @@ use dashmap::DashMap;
 use tch::Device;
 
 pub trait Job {
-    fn id(&self) -> ModelHandle;
-
     fn load(&mut self, device: Device);
     fn stash(&mut self);
 }

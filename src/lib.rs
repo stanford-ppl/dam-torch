@@ -3,6 +3,9 @@ pub mod model;
 pub mod model_context;
 
 #[cfg(test)]
+mod resources;
+
+#[cfg(test)]
 mod tests {
     use tch::{Cuda, Tensor};
 
