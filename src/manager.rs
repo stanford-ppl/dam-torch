@@ -205,4 +205,41 @@ mod test {
         let _ = dbg!(r1);
         let _ = dbg!(r2);
     }
+
+    #[test]
+    fn test_management_parallel() {
+        let mut model = Model::from_module(add_ten_cmodule());
+        let mut model2 = Model::from_module(add_ten_cmodule());
+        println!("Models loaded");
+        model.stash();
+        model2.stash();
+
+        let ref1 = JobRef::new(model);
+        let ref2 = JobRef::new(model2);
+
+        let device = tch::Device::cuda_if_available();
+
+        std::thread::scope(|scope| {
+            let spawn = |job: JobRef<Model<tch::CModule>>| {
+                scope.spawn(move || {
+                    for i in 0..64 {
+                        let test_tensor = tch::Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4]);
+                        let ret = job_manager().with_license(device, &job, |jref| {
+                            println!("Spawning Job, iteration {i:?}");
+                            jref.job()
+                                .as_ref()
+                                .unwrap()
+                                .forward_ts(&[&test_tensor])
+                                .unwrap()
+                        });
+
+                        let _ = dbg!(ret);
+                    }
+                });
+            };
+
+            spawn(ref1);
+            spawn(ref2);
+        });
+    }
 }
