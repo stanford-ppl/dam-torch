@@ -6,6 +6,7 @@ use dam::{
     context_tools::*,
     logging::{copy_log, initialize_log},
     structures::{Identifiable, Identifier, ParentView, Time, TimeViewable, VerboseIdentifier},
+    types::Cleanable,
 };
 
 use crate::{
@@ -17,9 +18,9 @@ pub trait AdapterType<InType, OutType, ModelType> {
     // Converts between inputs
     fn to_input(&self, input: Vec<InType>) -> Vec<tch::Tensor>;
 
-    fn from_output(&self, model_output: Vec<tch::Tensor>) -> Vec<OutType>;
+    fn from_output(&self, model_output: tch::Tensor) -> Vec<OutType>;
 
-    fn run(&self, model: &ModelType, input: Vec<tch::Tensor>) -> Vec<tch::Tensor>;
+    fn run(&self, model: &ModelType, input: Vec<tch::Tensor>) -> tch::Tensor;
 }
 
 pub struct ModelContext<T, RecvType: DAMType, SendType: DAMType, AT> {
@@ -48,6 +49,7 @@ where
         model: Model<T>,
         adapter: AT,
         latency: u64,
+        initiation_interval: u64,
         device: tch::Device,
     ) -> Self {
         let (comm_snd, comm_rcv) = match queue_depth {
@@ -72,6 +74,7 @@ where
                 adapter,
                 latency,
                 device,
+                initiation_interval,
                 context_info: Default::default(),
             }
             .into(),
@@ -124,6 +127,7 @@ where
                     initialize_log(logger);
                 }
                 self.batcher.run();
+                self.batcher.cleanup();
             });
             s.spawn(|| {
                 if let Some(mut logger) = write_log {
@@ -131,6 +135,7 @@ where
                     initialize_log(logger);
                 }
                 self.engine.run();
+                self.engine.cleanup();
             });
         });
     }
@@ -190,10 +195,10 @@ impl<RT: DAMType> Context for InputBatcher<RT> {
                     Ok(ChannelElement { time, data }) => {
                         // If we're too late. Send what we have and then continue.
                         if let Some(start) = batch_start {
-                            if start + self.wait_latency > time {
+                            if start + self.wait_latency < time {
                                 let transmit_time = start + self.wait_latency;
                                 let _ = self.communicator.send((transmit_time, batch));
-                                break 'main;
+                                continue 'main;
                             }
                         }
 
@@ -211,7 +216,7 @@ impl<RT: DAMType> Context for InputBatcher<RT> {
                             // our batch is full, so we should send it along.
                             let transmit_time = self.time.tick();
                             let _ = self.communicator.send((transmit_time, batch));
-                            break 'main;
+                            continue 'main;
                         }
                     }
                     Err(_) if batch.is_empty() => {
@@ -239,6 +244,7 @@ pub struct InferenceEngine<T, RT: DAMType, ST: DAMType, AT> {
     output: Sender<ST>,
     adapter: AT,
     latency: u64,
+    initiation_interval: u64,
     device: tch::Device,
 }
 
@@ -275,6 +281,7 @@ where
                             )
                             .unwrap();
                     }
+                    self.time.incr_cycles(self.initiation_interval);
                 }
 
                 // Our job here is finished.
@@ -286,6 +293,115 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use dam::{
+        context_tools::ChannelElement,
+        simulation::ProgramBuilder,
+        utility_contexts::{BroadcastContext, FunctionContext, GeneratorContext},
+    };
+    use tch::CModule;
+
+    use crate::{manager::Job, model::Model, resources::add_ten_cmodule};
+
+    use super::{AdapterType, ModelContext};
+
+    struct BasicAdapter {}
+
+    impl AdapterType<f64, f64, CModule> for BasicAdapter {
+        fn to_input(&self, input: Vec<f64>) -> Vec<tch::Tensor> {
+            vec![tch::Tensor::from_slice(&input)]
+        }
+
+        fn from_output(&self, model_output: tch::Tensor) -> Vec<f64> {
+            model_output.iter::<f64>().unwrap().collect()
+        }
+
+        fn run(&self, model: &CModule, input: Vec<tch::Tensor>) -> tch::Tensor {
+            model.forward_ts(&input).unwrap()
+        }
+    }
+
     #[test]
-    fn test_context() {}
+    fn basic_test() {
+        const NUM_MODELS: usize = 32;
+        const WAIT_LATENCY: u64 = 1024;
+        const MAX_BATCH_SIZE: usize = 8;
+        const MODEL_LATENCY: u64 = 73;
+        const MODEL_II: u64 = 1;
+        const NUM_INPUTS: usize = 64;
+        let device = tch::Device::cuda_if_available();
+
+        let mut ctx = ProgramBuilder::default();
+
+        let (input_snd, input_rcv) = ctx.unbounded();
+        ctx.add_child(GeneratorContext::new(
+            || {
+                // Generate one f64 at a time.
+                (0..NUM_INPUTS).map(|x| x as f64)
+            },
+            input_snd,
+        ));
+
+        let mut broadcaster = BroadcastContext::new(input_rcv);
+
+        // stash the results into a list.
+        let results = Arc::new(RwLock::new(vec![]));
+
+        for _ in 0..NUM_MODELS {
+            let (lsnd, lrcv) = ctx.unbounded();
+            broadcaster.add_target(lsnd);
+            let (output_snd, output_rcv) = ctx.unbounded();
+            let mut model = Model::from_module(add_ten_cmodule());
+            model.stash();
+            ctx.add_child(ModelContext::new(
+                lrcv,
+                output_snd,
+                Some(4),
+                WAIT_LATENCY,
+                MAX_BATCH_SIZE,
+                model,
+                BasicAdapter {},
+                MODEL_LATENCY,
+                MODEL_II,
+                device,
+            ));
+            let stash = Arc::new(Mutex::new(vec![]));
+            results.write().unwrap().push(stash.clone());
+            let mut accumulator = FunctionContext::default();
+            output_rcv.attach_receiver(&accumulator);
+            accumulator.set_run(move |time| loop {
+                match output_rcv.dequeue(&time) {
+                    Ok(ce) => stash.lock().unwrap().push(ce),
+                    Err(_) => return,
+                }
+            });
+            ctx.add_child(accumulator);
+        }
+
+        ctx.add_child(broadcaster);
+        ctx.initialize(Default::default())
+            .unwrap()
+            .run(Default::default());
+
+        // At this point, results should have a list of timing traces
+        let all_vecs = results.read().unwrap();
+        for ind in 0..NUM_INPUTS {
+            let mut values = vec![];
+            for res in all_vecs.iter() {
+                let value = res.lock().unwrap().get(ind).unwrap().clone();
+                values.push(value);
+            }
+            let all_equals = values.windows(2).all(|slice| {
+                let ChannelElement { time: t1, data: d1 } = slice[0];
+                let ChannelElement { time: t2, data: d2 } = slice[1];
+                t1 == t2 && d1 == d2
+            });
+            assert!(
+                all_equals,
+                "Mismatch between values at iteration {ind:?}: {:?}",
+                values
+            );
+        }
+    }
 }

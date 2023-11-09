@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tch = {version = "0.14.0", features=["download-libtorch"]}
+tch = {version = "0.14.0"}
 dam = {version = "0.1.0", features=["dot"], default-features=false, git = "https://github.com/stanford-ppl/DAM-RS.git", branch="dev"}
 tempfile = "3.8.1"
 thiserror = "1.0.50"
