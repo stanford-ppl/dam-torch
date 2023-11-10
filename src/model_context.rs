@@ -46,7 +46,7 @@ where
         queue_depth: Option<usize>,
         wait_latency: u64,
         max_batch_size: usize,
-        model: Model<T>,
+        model: JobRef<Model<T>>,
         adapter: AT,
         latency: u64,
         initiation_interval: u64,
@@ -69,7 +69,7 @@ where
             .into(),
             engine: InferenceEngine {
                 communicator: comm_rcv,
-                model: JobRef::new(model),
+                model,
                 output,
                 adapter,
                 latency,
@@ -297,12 +297,19 @@ mod test {
 
     use dam::{
         context_tools::ChannelElement,
-        simulation::ProgramBuilder,
+        simulation::{
+            InitializationOptions, InitializationOptionsBuilder, ProgramBuilder, RunMode,
+            RunOptionsBuilder,
+        },
         utility_contexts::{BroadcastContext, FunctionContext, GeneratorContext},
     };
     use tch::CModule;
 
-    use crate::{manager::Job, model::Model, resources::add_ten_cmodule};
+    use crate::{
+        manager::{Job, JobRef},
+        model::Model,
+        resources::add_ten_cmodule,
+    };
 
     use super::{AdapterType, ModelContext};
 
@@ -324,13 +331,17 @@ mod test {
 
     #[test]
     fn basic_test() {
-        const NUM_MODELS: usize = 32;
+        const NUM_MODELS: usize = 3172;
         const WAIT_LATENCY: u64 = 1024;
-        const MAX_BATCH_SIZE: usize = 8;
+        const MAX_BATCH_SIZE: usize = 128;
         const MODEL_LATENCY: u64 = 73;
         const MODEL_II: u64 = 1;
-        const NUM_INPUTS: usize = 64;
+        const NUM_BATCHES: usize = 64;
+        const NUM_INPUTS: usize = NUM_BATCHES * MAX_BATCH_SIZE;
+        const NUM_INVOCATIONS: usize = NUM_INPUTS / MAX_BATCH_SIZE * NUM_MODELS;
+        dbg!(NUM_INVOCATIONS);
         let device = tch::Device::cuda_if_available();
+        dbg!(device);
 
         let mut ctx = ProgramBuilder::default();
 
@@ -347,20 +358,23 @@ mod test {
 
         // stash the results into a list.
         let results = Arc::new(RwLock::new(vec![]));
+        let mut model = Model::from_module(add_ten_cmodule());
+        model.stash();
+
+        let jref = JobRef::new(model);
 
         for _ in 0..NUM_MODELS {
             let (lsnd, lrcv) = ctx.unbounded();
             broadcaster.add_target(lsnd);
             let (output_snd, output_rcv) = ctx.unbounded();
-            let mut model = Model::from_module(add_ten_cmodule());
-            model.stash();
+
             ctx.add_child(ModelContext::new(
                 lrcv,
                 output_snd,
                 Some(4),
                 WAIT_LATENCY,
                 MAX_BATCH_SIZE,
-                model,
+                jref.clone(),
                 BasicAdapter {},
                 MODEL_LATENCY,
                 MODEL_II,
@@ -380,9 +394,19 @@ mod test {
         }
 
         ctx.add_child(broadcaster);
-        ctx.initialize(Default::default())
-            .unwrap()
-            .run(Default::default());
+        ctx.initialize(
+            InitializationOptionsBuilder::default()
+                .run_flavor_inference(true)
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
+        .run(
+            RunOptionsBuilder::default()
+                .mode(RunMode::FIFO)
+                .build()
+                .unwrap(),
+        );
 
         // At this point, results should have a list of timing traces
         let all_vecs = results.read().unwrap();
@@ -402,6 +426,95 @@ mod test {
                 "Mismatch between values at iteration {ind:?}: {:?}",
                 values
             );
+        }
+    }
+
+    #[test]
+    fn latency_sensitive_test() {
+        const NUM_WORKERS: usize = 2;
+        const WAIT_LATENCY: u64 = 80;
+        const MAX_BATCH_SIZE: usize = 64;
+        const MODEL_LATENCY: u64 = 73;
+        const MODEL_II: u64 = 64;
+        const TOTAL_INPUTS: usize = 8192;
+        // const NUM_INPUTS_PER_WORKER: usize = 4096;
+        let device = tch::Device::cuda_if_available();
+
+        let mut ctx = ProgramBuilder::default();
+
+        let (input_senders, input_receivers): (Vec<_>, Vec<_>) =
+            (0..NUM_WORKERS).map(|_| ctx.unbounded()).unzip();
+
+        let mut input_generator = FunctionContext::default();
+        input_senders
+            .iter()
+            .for_each(|snd| snd.attach_sender(&input_generator));
+
+        input_generator.set_run(move |time| {
+            for iter in 0..TOTAL_INPUTS {
+                // generate an input and send it somewhere.
+                let value = iter as f64;
+
+                let target = iter % NUM_WORKERS;
+                input_senders[target]
+                    .enqueue(
+                        &time,
+                        ChannelElement {
+                            time: time.tick() + 1,
+                            data: value,
+                        },
+                    )
+                    .unwrap();
+                time.incr_cycles(1);
+            }
+            // pick a sender and send to it.
+        });
+
+        ctx.add_child(input_generator);
+
+        // stash the results into a list.
+        let results = Arc::new(RwLock::new(vec![]));
+        let mut model = Model::from_module(add_ten_cmodule());
+        model.stash();
+
+        let jref = JobRef::new(model);
+
+        for lrcv in input_receivers {
+            let (output_snd, output_rcv) = ctx.unbounded();
+
+            ctx.add_child(ModelContext::new(
+                lrcv,
+                output_snd,
+                Some(4),
+                WAIT_LATENCY,
+                MAX_BATCH_SIZE,
+                jref.clone(),
+                BasicAdapter {},
+                MODEL_LATENCY,
+                MODEL_II,
+                device,
+            ));
+            let stash = Arc::new(Mutex::new(vec![]));
+            results.write().unwrap().push(stash.clone());
+            let mut accumulator = FunctionContext::default();
+            output_rcv.attach_receiver(&accumulator);
+            accumulator.set_run(move |time| loop {
+                match output_rcv.dequeue(&time) {
+                    Ok(ce) => stash.lock().unwrap().push(ce),
+                    Err(_) => return,
+                }
+            });
+            ctx.add_child(accumulator);
+        }
+        ctx.initialize(Default::default())
+            .unwrap()
+            .run(Default::default());
+
+        // At this point, results should have a list of timing traces
+        let all_vecs = results.read().unwrap();
+        for worker in 0..NUM_WORKERS {
+            let values = all_vecs[worker].lock().unwrap();
+            println!("Trace from worker {worker:?}: {values:?}");
         }
     }
 }

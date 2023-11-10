@@ -8,10 +8,18 @@ pub trait Job: Sync + Send {
     fn stash(&mut self);
 }
 
-#[derive(Clone)]
 pub struct JobRef<T> {
     id: ModelHandle,
     job: Arc<Mutex<T>>,
+}
+
+impl<T> Clone for JobRef<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            job: self.job.clone(),
+        }
+    }
 }
 
 impl<T> JobRef<T>
