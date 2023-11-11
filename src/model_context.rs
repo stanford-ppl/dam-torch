@@ -297,8 +297,7 @@ mod test {
 
     use dam::{
         context_tools::ChannelElement,
-        simulation::{
-            InitializationOptions, InitializationOptionsBuilder, ProgramBuilder, RunMode,
+        simulation::{InitializationOptionsBuilder, ProgramBuilder, RunMode,
             RunOptionsBuilder,
         },
         utility_contexts::{BroadcastContext, FunctionContext, GeneratorContext},
