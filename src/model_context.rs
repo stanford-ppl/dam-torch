@@ -297,9 +297,7 @@ mod test {
 
     use dam::{
         context_tools::ChannelElement,
-        simulation::{InitializationOptionsBuilder, ProgramBuilder, RunMode,
-            RunOptionsBuilder,
-        },
+        simulation::{InitializationOptionsBuilder, ProgramBuilder, RunMode, RunOptionsBuilder},
         utility_contexts::{BroadcastContext, FunctionContext, GeneratorContext},
     };
     use tch::CModule;
