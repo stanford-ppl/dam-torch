@@ -372,8 +372,9 @@ mod test {
         const NUM_INPUTS: usize = NUM_BATCHES * MAX_BATCH_SIZE;
         const NUM_INVOCATIONS: usize = NUM_INPUTS / MAX_BATCH_SIZE * NUM_MODELS;
         dbg!(NUM_INVOCATIONS);
-        let device = tch::Device::cuda_if_available();
-        dbg!(device);
+        if !tch::Cuda::is_available() {
+            return;
+        }
 
         let mut ctx = ProgramBuilder::default();
 
@@ -395,7 +396,8 @@ mod test {
 
         let jref = JobRef::new(model);
 
-        for _ in 0..NUM_MODELS {
+        for index in 0..NUM_MODELS {
+            let device = tch::Device::Cuda(index % (tch::Cuda::device_count() as usize));
             let (lsnd, lrcv) = ctx.unbounded();
             broadcaster.add_target(lsnd);
             let (output_snd, output_rcv) = ctx.unbounded();
