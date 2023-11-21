@@ -334,12 +334,14 @@ mod test {
     use super::{AdapterType, ModelContext};
 
     type DTYPE = f32;
-    struct BasicAdapter {}
+    struct BasicAdapter {
+        device: tch::Device,
+    }
 
     impl AdapterType<DTYPE, DTYPE, CModule> for BasicAdapter {
         fn to_input(&self, input: Vec<DTYPE>) -> Vec<tch::Tensor> {
             vec![tch::Tensor::from_slice(&input)
-                .to(tch::Device::cuda_if_available())
+                .to(self.device)
                 .to_kind(tch::Kind::Float)]
         }
 
@@ -402,7 +404,7 @@ mod test {
                 WAIT_LATENCY,
                 MAX_BATCH_SIZE,
                 jref.clone(),
-                BasicAdapter {},
+                BasicAdapter { device },
                 MODEL_LATENCY,
                 MODEL_II,
                 device,
