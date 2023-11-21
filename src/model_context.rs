@@ -4,10 +4,12 @@ use dam::{
     channel::ChannelID,
     context::{self, ContextSummary, ExplicitConnections, ProxyContext},
     context_tools::*,
+    dam_macros::event_type,
     logging::{copy_log, initialize_log},
     structures::{Identifiable, Identifier, ParentView, Time, TimeViewable, VerboseIdentifier},
     types::Cleanable,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     manager::{job_manager, Job, JobRef},
@@ -248,6 +250,13 @@ pub struct InferenceEngine<T, RT: DAMType, ST: DAMType, AT> {
     device: tch::Device,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[event_type]
+pub struct InferenceData {
+    elapsed: u64,
+    batch_size: usize,
+}
+
 impl<T: Send + Sync + 'static, RT: DAMType, ST: DAMType, AT> Context
     for InferenceEngine<T, RT, ST, AT>
 where
@@ -266,7 +275,16 @@ where
                     // run the model
                     let raw_outputs =
                         job_manager().with_license(self.device, &self.model, |jref| {
-                            self.adapter.run(jref.job().as_ref().unwrap(), inputs)
+                            let start = std::time::Instant::now();
+                            let batch_size = inputs.iter().map(|input| input.numel()).sum();
+                            let result = self.adapter.run(jref.job().as_ref().unwrap(), inputs);
+                            let elapsed = start.elapsed();
+                            dam::logging::log_event(&InferenceData {
+                                elapsed: elapsed.as_micros() as u64,
+                                batch_size,
+                            })
+                            .unwrap();
+                            result
                         });
 
                     let target_time = self.time.tick() + self.latency;
@@ -297,7 +315,11 @@ mod test {
 
     use dam::{
         context_tools::ChannelElement,
-        simulation::{InitializationOptionsBuilder, ProgramBuilder, RunMode, RunOptionsBuilder},
+        logging::{LogEvent, LogFilter},
+        simulation::{
+            InitializationOptionsBuilder, LogFilterKind, LoggingOptions, MongoOptionsBuilder,
+            ProgramBuilder, RunMode, RunOptionsBuilder,
+        },
         utility_contexts::{BroadcastContext, FunctionContext, GeneratorContext},
     };
     use tch::CModule;
@@ -305,6 +327,7 @@ mod test {
     use crate::{
         manager::{Job, JobRef},
         model::Model,
+        model_context::InferenceData,
         resources::add_ten_cmodule,
     };
 
@@ -328,9 +351,9 @@ mod test {
 
     #[test]
     fn basic_test() {
-        const NUM_MODELS: usize = 3172;
-        const WAIT_LATENCY: u64 = 1024;
-        const MAX_BATCH_SIZE: usize = 128;
+        const NUM_MODELS: usize = 1;
+        const WAIT_LATENCY: u64 = 8192;
+        const MAX_BATCH_SIZE: usize = 4096;
         const MODEL_LATENCY: u64 = 73;
         const MODEL_II: u64 = 1;
         const NUM_BATCHES: usize = 64;
@@ -401,6 +424,16 @@ mod test {
         .run(
             RunOptionsBuilder::default()
                 .mode(RunMode::FIFO)
+                .log_filter(LogFilterKind::Blanket(LogFilter::Some(
+                    [InferenceData::NAME.to_owned()].into(),
+                )))
+                .logging(LoggingOptions::Mongo(
+                    MongoOptionsBuilder::default()
+                        .db("InferenceLog".to_string())
+                        .uri("mongodb://127.0.0.1:27017".to_string())
+                        .build()
+                        .unwrap(),
+                ))
                 .build()
                 .unwrap(),
         );
