@@ -276,6 +276,9 @@ where
                     let raw_outputs =
                         job_manager().with_license(self.device, &self.model, |jref| {
                             let batch_size = inputs.iter().map(|input| input.numel()).sum();
+                            if let tch::Device::Cuda(x) = self.device {
+                                tch::Cuda::synchronize(x as i64);
+                            }
                             let start = std::time::Instant::now();
                             let result = self.adapter.run(jref.job().as_ref().unwrap(), inputs);
                             if let tch::Device::Cuda(x) = self.device {
@@ -364,6 +367,7 @@ mod test {
     #[test]
     fn basic_test() {
         const NUM_MODELS: usize = 1;
+        const NUM_GPUS: usize = 1;
         const WAIT_LATENCY: u64 = 8192;
         const MAX_BATCH_SIZE: usize = 1024;
         const MODEL_LATENCY: u64 = 73;
@@ -397,7 +401,7 @@ mod test {
         let jref = JobRef::new(model);
 
         for index in 0..NUM_MODELS {
-            let device = tch::Device::Cuda(index % (tch::Cuda::device_count() as usize));
+            let device = tch::Device::Cuda(index % NUM_GPUS);
             let (lsnd, lrcv) = ctx.unbounded();
             broadcaster.add_target(lsnd);
             let (output_snd, output_rcv) = ctx.unbounded();
@@ -405,7 +409,7 @@ mod test {
             ctx.add_child(ModelContext::new(
                 lrcv,
                 output_snd,
-                Some(4),
+                None,
                 WAIT_LATENCY,
                 MAX_BATCH_SIZE,
                 jref.clone(),
